@@ -1,8 +1,6 @@
-
 # imports
 from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel
-from typing import Optional
 import json
 import googlemaps
 import os
@@ -11,14 +9,13 @@ import os
 MAX_HITS = None
 app = FastAPI()
 GM = googlemaps.Client(key="AIzaSyC6YLATu4aS3x0B91uHqxtjad-PeQ6XupU")
+dict_for_count_searches = dict([])
 
 
 class Distance(BaseModel):
     source: str
     destination: str
     distance: str
-    hits_1: Optional[int] = None  # num of 'source - destination' searching
-    hits_2: Optional[int] = None  # num of 'destination - source' searching
 
 
 def set_name_of_city(city: str) -> str:
@@ -33,44 +30,66 @@ def set_name_of_city(city: str) -> str:
 def add_distance_to_db(source: str, destination: str, the_distance: str):
     """
 
-    :param the_source:  City number 1 to calculate distance
-    :param the_destination: City number 2 to calculate distance
+    :param source:  City number 1 to calculate distance
+    :param destination: City number 2 to calculate distance
     :param the_distance: The distance between 2 cities
     The function add a new distance to the local db
     """
     source = set_name_of_city(source)
     destination = set_name_of_city(destination)
-    hit_1 = 0
-    hit_2 = 0
+    dict_for_count_searches[source + destination] = 1
+    dict_for_count_searches[destination + source] = 0
     if source > destination:
         the_source = destination
         the_destination = source
-        hit_2 = 1
     else:
         the_source = source
         the_destination = destination
-        hit_1 = 1
 
     new_distance = {
         "source": the_source,
         "destination": the_destination,
         "distance": the_distance,
-        "hits_1": hit_1,
-        "hits_2": hit_2
-    }
 
+    }
     my_distances.append(new_distance)
     with open('cities.json', 'w') as f:
         json.dump(my_distances, f, indent=len(my_distances))
-    return new_distance
 
 
-def update_max_hints(distance:Distance,hits:str):
+def update_max_hints(source: str, destination: str, distance: str):
+    """
+    Compare sum of searching between current max and new option
+    :param source:
+    :param destination:
+    :param distance:
+    """
+
+    new_distance ={
+        "source": source,
+        "destination": destination,
+        "distance": distance
+
+    }
+
     global MAX_HITS
-    if not MAX_HITS or distance[hits] > MAX_HITS[hits]:
-        MAX_HITS = distance
+    if not MAX_HITS:
+        MAX_HITS = new_distance
+        return
+    if source + destination in dict_for_count_searches:
+        if dict_for_count_searches[MAX_HITS['source'] + MAX_HITS['destination']] < \
+                dict_for_count_searches[source + destination]:
+            MAX_HITS = new_distance
+    return
+
 
 def found_distance(city_1: str, city_2: str):
+    """
+
+    :param city_1:
+    :param city_2:
+    :return: The distance between 2 cities
+    """
     distance = GM.distance_matrix(city_1, city_2)['rows'][0]['elements'][0]
     if distance['status'] == 'OK':
         return True, distance['distance']['text']
@@ -99,26 +118,33 @@ def get_distance(source: str, destination: str):
     source = set_name_of_city(source)
     destination = set_name_of_city(destination)
     if source < destination:
-        hits = 'hits_1'
+        in_place = True
     else:
         source, destination = destination, source
-        hits = 'hits_2'
-    for distance in my_distances:
-        if distance['source'] == source and distance['destination'] == destination:
-            # Add 1 to count of searching
-            distance[hits] += 1
-            with open('cities.json', 'w') as f:
-                json.dump(my_distances, f, indent=len(my_distances))
-            # if this searching is more than previous max, set the max
-            update_max_hints(distance,hits)
-            return {"distance": distance['distance']}
+        in_place = False
+
+    if source + destination in dict_for_count_searches or destination + source in dict_for_count_searches:
+        for distance in my_distances:
+            if distance['source'] == source and distance['destination'] == destination:
+                # Add 1 to count of searching
+                if in_place:
+                    dict_for_count_searches[source + destination] += 1
+                    update_max_hints(source, destination, distance['distance'])
+                else:
+                    dict_for_count_searches[destination + source] += 1
+                    update_max_hints(destination, source, distance['distance'])
+                # if this searching is more than previous max, set the max
+                return {"distance": distance['distance']}
+
     # If the distance was not stored in db before, find it and store in the local db
     valid, new_distance = found_distance(source, destination)
     if valid:
-        update_max_hints(add_distance_to_db(source, destination, new_distance),hits)
+        add_distance_to_db(source, destination, new_distance)
+        update_max_hints(source, destination, new_distance)
     else:
         return HTTPException(status_code=500, detail="No Results.")
     return {"distance": new_distance}
+
 
 
 @app.get('/health', status_code=200)
@@ -136,19 +162,20 @@ def check_health():
         return HTTPException(status_code=500, detail="No Connection to The DB")
 
 
+
 @app.get('/popularsearch', status_code=200)
 def check_popular():
     """
     :return: The most popular search and number of hits for that search
     """
+
     if not MAX_HITS:
         return HTTPException(status_code=500, detail="No searching")
 
-    # hits_1 is the stored order, hit_2 is the reverse order
-    if MAX_HITS['hits_2'] > MAX_HITS['hits_1']:
-        return {"source": MAX_HITS['destination'], "destination": MAX_HITS['source'], "hits": MAX_HITS['hits_2']}
-    else:
-        return {"source": MAX_HITS['source'], "destination": MAX_HITS['destination'], "hits": MAX_HITS['hits_1']}
+
+    source = MAX_HITS['source']
+    destination = MAX_HITS['destination']
+    return {"source": source, "destination": destination, "hits": dict_for_count_searches[source + destination]}
 
 
 @app.post('/distance', status_code=201)
@@ -161,34 +188,34 @@ def change_distance(my_distance: Distance):
     source = set_name_of_city(my_distance.source)
     destination = set_name_of_city(my_distance.destination)
     the_distance = my_distance.distance
+    place_of_search = 0
     if source > destination:
         source, destination = destination, source
+        place_of_search = 1
 
-    exist_in_local_db = False
     new_distance = {
         "source": source,
         "destination": destination,
         "distance": the_distance,
-        "hits_1": 0,
-        "hits_2": 0
-    }
 
-    for distance in my_distances:
-        if distance['source'] == source and distance['destination'] == destination:
-            exist_in_local_db = True
-            new_distance['hits_1'] = distance['hits_1']
-            new_distance['hits_2'] = distance['hits_2']
-            my_distances.remove(distance)
-            my_distances.append(new_distance)
-    # Apply changes to the DB
-    with open('cities.json', 'w') as f:
-        json.dump(my_distances, f, indent=len(my_distances))
-    if not exist_in_local_db:
+    }
+    if source + destination in dict_for_count_searches:
+        for distance in my_distances:
+            if distance['source'] == source and distance['destination'] == destination:
+                my_distances.remove(distance)
+                my_distances.append(new_distance)
+        # Apply changes to the DB
+        with open('cities.json', 'w') as f:
+            json.dump(my_distances, f, indent=len(my_distances))
+
+    else:
         my_distances.append(new_distance)
         # Apply changes to the DB
         with open('cities.json', 'w') as f:
             json.dump(my_distances, f, indent=len(my_distances))
-    return {"source": source, "destination": destination, "hits": the_distance}
+        dict_for_count_searches[source + destination] = [0, 0]
+    the_hits = dict_for_count_searches[source + destination][place_of_search]
+    return {"source": source, "destination": destination, "hits": the_hits}
 
 
 # Beginning
